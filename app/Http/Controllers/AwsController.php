@@ -2,13 +2,14 @@
 
 namespace App\Http\Controllers;
 
+use App\Jobs\CheckRdpPasswordJob;
 use App\Jobs\CreateWindowsRdpJob;
 use App\Models\AwsAccount;
 use App\Models\RdpInstance;
 use App\Services\AwsService;
-use App\Jobs\CheckRdpPasswordJob;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
+use Inertia\Inertia;
 
 class AwsController extends Controller
 {
@@ -24,23 +25,36 @@ class AwsController extends Controller
         $instances = RdpInstance::with('awsAccount')
             ->orderBy('created_at', 'desc')
             ->paginate(10);
+        $isAdmin = request()->routeIs('admin.*');
+        $page = $isAdmin ? 'Admin/Aws/Index' : 'User/Aws/Index';
 
-        return view('aws.index', compact('instances'));
+        return Inertia::render($page, [
+            'instances' => $instances->items(),
+            'pagination' => [
+                'current_page' => $instances->currentPage(),
+                'last_page' => $instances->lastPage(),
+                'per_page' => $instances->perPage(),
+                'total' => $instances->total(),
+            ],
+        ]);
     }
 
     public function create()
     {
         $accounts = AwsAccount::all();
-
         $regions = [
             'us-east-1' => 'US East (N. Virginia)',
             'us-east-2' => 'US East (Ohio)',
             'us-west-1' => 'US West (N. California)',
             'us-west-2' => 'US West (Oregon)',
         ];
+        $isAdmin = request()->routeIs('admin.*');
+        $page = $isAdmin ? 'Admin/Aws/Create' : 'User/Aws/Create';
 
-        // FIX: Pass 'regions' as a string, not the variable $regions
-        return view('aws.create', compact('accounts', 'regions'));
+        return Inertia::render($page, [
+            'accounts' => $accounts,
+            'regions' => $regions,
+        ]);
     }
 
     /**
@@ -50,8 +64,8 @@ class AwsController extends Controller
     {
         $request->validate([
             'aws_account_id' => 'required|exists:aws_accounts,id',
-            'region'         => 'required|string|in:us-east-1,us-east-2,us-west-1,us-west-2',
-            'name_prefix'    => 'nullable|string|max:20',
+            'region' => 'required|string|in:us-east-1,us-east-2,us-west-1,us-west-2',
+            'name_prefix' => 'nullable|string|max:20',
         ]);
 
         try {
@@ -68,12 +82,12 @@ class AwsController extends Controller
             // 3. Dispatch polling job
             CheckRdpPasswordJob::dispatch($instance)->delay(now()->addMinutes(4));
 
-            return redirect()->route('aws.index')
-                ->with('success', "RDP creation started in {$request->region}. Password ready in ~5m.");
+            return redirect()->back()->with('success', "RDP creation started in {$request->region}. Password ready in ~5m.");
 
         } catch (\Exception $e) {
-            Log::error("RDP Creation Failed: " . $e->getMessage());
-            return back()->withInput()->withErrors($e->getMessage());
+            Log::error('RDP Creation Failed: '.$e->getMessage());
+
+            return redirect()->back()->withInput()->withErrors(['error' => $e->getMessage()]);
         }
     }
 
@@ -88,13 +102,14 @@ class AwsController extends Controller
             $success = $this->awsService->terminateInstance($instance);
 
             if ($success) {
-                return redirect()->route('aws.index')->with('success', 'RDP termination initiated.');
+                return redirect()->back()->with('success', 'RDP termination initiated.');
             }
 
-            return back()->withErrors('Termination failed. Check logs.');
+            return redirect()->back()->withErrors(['error' => 'Termination failed. Check logs.']);
         } catch (\Exception $e) {
-            Log::error("Manual Termination Error: " . $e->getMessage());
-            return back()->withErrors($e->getMessage());
+            Log::error('Manual Termination Error: '.$e->getMessage());
+
+            return redirect()->back()->withErrors(['error' => $e->getMessage()]);
         }
     }
 
@@ -112,9 +127,10 @@ class AwsController extends Controller
                     $this->awsService->setAccount($account)->syncInstanceStatuses($region);
                 }
             }
-            return back()->with('success', 'All instances synced across all regions.');
+
+            return redirect()->back()->with('success', 'All instances synced across all regions.');
         } catch (\Exception $e) {
-            return back()->withErrors('Sync error: ' . $e->getMessage());
+            return redirect()->back()->withErrors(['error' => 'Sync error: '.$e->getMessage()]);
         }
     }
 
@@ -122,7 +138,7 @@ class AwsController extends Controller
     {
         $request->validate([
             'count' => 'required|integer|min:1|max:100',
-            'prefix' => 'nullable|string|max:10'
+            'prefix' => 'nullable|string|max:10',
         ]);
 
         $requested = $request->count;
@@ -133,20 +149,22 @@ class AwsController extends Controller
         $totalAvailable = array_sum(array_map('array_sum', $inventory));
 
         if ($requested > $totalAvailable) {
-            return back()->withErrors("Not enough capacity. Total slots available: $totalAvailable");
+            return redirect()->back()->withErrors(['error' => "Not enough capacity. Total slots available: $totalAvailable"]);
         }
 
         $dispatched = 0;
         foreach ($inventory as $accountId => $regions) {
             foreach ($regions as $region => $freeSlots) {
                 for ($i = 0; $i < $freeSlots; $i++) {
-                    if ($dispatched >= $requested) break 2;
+                    if ($dispatched >= $requested) {
+                        break 2;
+                    }
 
                     // 2. Dispatch the creation to the background
                     CreateWindowsRdpJob::dispatch(
                         $accountId,
                         $region,
-                        "{$prefix}-" . ($dispatched + 1)
+                        "{$prefix}-".($dispatched + 1)
                     );
 
                     $dispatched++;
@@ -154,6 +172,6 @@ class AwsController extends Controller
             }
         }
 
-        return redirect()->route('aws.index')->with('success', "Dispatched $dispatched RDP creation jobs.");
+        return redirect()->back()->with('success', "Dispatched $dispatched RDP creation jobs.");
     }
 }
