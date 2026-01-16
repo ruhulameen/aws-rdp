@@ -9,4 +9,5 @@ Route::get('/', function () {
 });
 
 Route::resource('aws-accounts', AwsAccountController::class);
+Route::post('aws/bulk-store', [AwsController::class, 'bulkStore'])->name('aws.bulk-store');
 Route::resource('aws', AwsController::class);

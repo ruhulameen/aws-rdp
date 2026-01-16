@@ -1,6 +1,8 @@
 <?php
+
 namespace App\Http\Controllers;
 
+use App\Jobs\CreateWindowsRdpJob;
 use App\Models\AwsAccount;
 use App\Models\RdpInstance;
 use App\Services\AwsService;
@@ -17,9 +19,6 @@ class AwsController extends Controller
         $this->awsService = $awsService;
     }
 
-    /**
-     * Display a listing of all RDP instances.
-     */
     public function index()
     {
         $instances = RdpInstance::with('awsAccount')
@@ -29,125 +28,132 @@ class AwsController extends Controller
         return view('aws.index', compact('instances'));
     }
 
-    /**
-     * Show the form for creating a new RDP.
-     */
     public function create()
     {
         $accounts = AwsAccount::all();
-        return view('aws.create', compact('accounts'));
+
+        $regions = [
+            'us-east-1' => 'US East (N. Virginia)',
+            'us-east-2' => 'US East (Ohio)',
+            'us-west-1' => 'US West (N. California)',
+            'us-west-2' => 'US West (Oregon)',
+        ];
+
+        // FIX: Pass 'regions' as a string, not the variable $regions
+        return view('aws.create', compact('accounts', 'regions'));
     }
 
     /**
-     * Store a newly created RDP in AWS and Database.
+     * Store a newly created RDP with Region Selection.
      */
     public function store(Request $request)
     {
         $request->validate([
             'aws_account_id' => 'required|exists:aws_accounts,id',
+            'region'         => 'required|string|in:us-east-1,us-east-2,us-west-1,us-west-2',
             'name_prefix'    => 'nullable|string|max:20',
         ]);
 
         try {
-            // 1. Fetch Account and Set Service
             $account = AwsAccount::findOrFail($request->aws_account_id);
+            $namePrefix = $request->name_prefix ?? 'rdp';
+
+            // 1. Initialize service with account
             $this->awsService->setAccount($account);
 
-            // 2. Provision on AWS
-            $namePrefix = $request->name_prefix ?? 'rdp-instance';
-            $awsData = $this->awsService->createWindowsRdp($namePrefix);
+            // 2. Call the service (Service now handles limit check and DB creation internally)
+            $result = $this->awsService->createWindowsRdp($namePrefix, $request->region);
+            $instance = $result['instance'];
 
-            // 3. Create Local Record
-            $instance = RdpInstance::create([
-                'aws_account_id' => $account->id,
-                'instance_id'    => $awsData['instance_id'],
-                'region'         => $awsData['region'],
-                'key_name'       => $awsData['key_name'],
-                'group_id'       => $awsData['group_id'],
-                'status'         => 'pending',
-            ]);
-
-            // 4. Dispatch the Background Job to poll for Password & IP
-            // We delay it by 4 minutes because Windows takes time to initialize
+            // 3. Dispatch polling job
             CheckRdpPasswordJob::dispatch($instance)->delay(now()->addMinutes(4));
 
             return redirect()->route('aws.index')
-                ->with('success', 'RDP Provisioning started. Password will be available in ~5 minutes.');
+                ->with('success', "RDP creation started in {$request->region}. Password ready in ~5m.");
 
         } catch (\Exception $e) {
             Log::error("RDP Creation Failed: " . $e->getMessage());
-            return back()->withErrors('Error: ' . $e->getMessage());
+            return back()->withInput()->withErrors($e->getMessage());
         }
     }
 
     /**
-     * Display the details of a specific RDP.
+     * Terminate the RDP instance using its stored Region.
      */
-    public function show(string $id)
+    public function destroy(string $id) // Use Route Model Binding
     {
         $instance = RdpInstance::with('awsAccount')->findOrFail($id);
-        return view('aws.show', compact('instance'));
-    }
-
-    /**
-     * Terminate and Remove the RDP instance.
-     */
-    public function destroy(string $id)
-    {
-        $instance = RdpInstance::with('awsAccount')->findOrFail($id);
-
         try {
-            // 1. Set the correct account credentials
-            $this->awsService->setAccount($instance->awsAccount);
+            // Service handles switching to the correct region based on $instance->region
+            $success = $this->awsService->terminateInstance($instance);
 
-            // 2. Perform termination and cleanup
-            $this->awsService->terminateInstance(
-                $instance->instance_id,
-                $instance->group_id, // Ensure you saved group_id in your table
-                $instance->key_name
-            );
+            if ($success) {
+                return redirect()->route('aws.index')->with('success', 'RDP termination initiated.');
+            }
 
-            // 3. Remove from local database
-            $instance->delete();
-
-            return redirect()->route('aws.index')->with('success', 'RDP terminated and cleaned up successfully.');
+            return back()->withErrors('Termination failed. Check logs.');
         } catch (\Exception $e) {
-            return back()->withErrors('Termination Error: ' . $e->getMessage());
+            Log::error("Manual Termination Error: " . $e->getMessage());
+            return back()->withErrors($e->getMessage());
         }
     }
 
     /**
-     * @throws \Exception
+     * Sync Statuses across multiple regions.
      */
     public function syncAll()
     {
-        $instances = RdpInstance::all();
+        $accounts = AwsAccount::all();
+        $regions = ['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2'];
 
-        // Group by AWS Account (because each account needs its own Client)
-        $groupedByAccount = $instances->groupBy('aws_account_id');
+        try {
+            foreach ($accounts as $account) {
+                foreach ($regions as $region) {
+                    $this->awsService->setAccount($account)->syncInstanceStatuses($region);
+                }
+            }
+            return back()->with('success', 'All instances synced across all regions.');
+        } catch (\Exception $e) {
+            return back()->withErrors('Sync error: ' . $e->getMessage());
+        }
+    }
 
-        foreach ($groupedByAccount as $accountId => $accountInstances) {
-            $account = AwsAccount::find($accountId);
-            $this->awsService->setAccount($account);
+    public function bulkStore(Request $request)
+    {
+        $request->validate([
+            'count' => 'required|integer|min:1|max:100',
+            'prefix' => 'nullable|string|max:10'
+        ]);
 
-            // Extract just the instance IDs
-            $awsIds = $accountInstances->pluck('instance_id')->toArray();
+        $requested = $request->count;
+        $prefix = $request->prefix ?? 'rdp';
 
-            // Fetch all statuses in one call
-            $awsStatuses = $this->awsService->getMultipleInstancesStatus($awsIds);
+        $inventory = $this->awsService->getGlobalInventory();
 
-            // Update your database
-            foreach ($accountInstances as $localInstance) {
-                if (isset($awsStatuses[$localInstance->instance_id])) {
-                    $statusData = $awsStatuses[$localInstance->instance_id];
-                    $localInstance->update([
-                        'status'    => $statusData['name'],
-                        'public_ip' => $statusData['public_ip']
-                    ]);
+        $totalAvailable = array_sum(array_map('array_sum', $inventory));
+
+        if ($requested > $totalAvailable) {
+            return back()->withErrors("Not enough capacity. Total slots available: $totalAvailable");
+        }
+
+        $dispatched = 0;
+        foreach ($inventory as $accountId => $regions) {
+            foreach ($regions as $region => $freeSlots) {
+                for ($i = 0; $i < $freeSlots; $i++) {
+                    if ($dispatched >= $requested) break 2;
+
+                    // 2. Dispatch the creation to the background
+                    CreateWindowsRdpJob::dispatch(
+                        $accountId,
+                        $region,
+                        "{$prefix}-" . ($dispatched + 1)
+                    );
+
+                    $dispatched++;
                 }
             }
         }
 
-        return back()->with('success', 'All instance statuses synced with AWS.');
+        return redirect()->route('aws.index')->with('success', "Dispatched $dispatched RDP creation jobs.");
     }
 }

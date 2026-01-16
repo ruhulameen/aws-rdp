@@ -40,6 +40,10 @@
                             <span class="px-3 py-1 bg-green-100 text-green-700 rounded-full text-xs font-bold">
                             <i class="fas fa-check-circle mr-1"></i> Running
                         </span>
+                        @elseif($instance->status == 'terminated')
+                            <span class="px-3 py-1 bg-green-100 text-green-700 rounded-full text-xs font-bold">
+                            <i class="fas fa-times mr-1"></i> Terminated
+                        </span>
                         @else
                             <span class="px-3 py-1 bg-red-100 text-red-700 rounded-full text-xs font-bold">Failed</span>
                         @endif
